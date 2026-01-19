@@ -22,10 +22,16 @@ class RobotBuilder:
 
         self.unique_names = {}
         self.stl_filenames: dict = {}
+        
+        # NEW: Store part colors for Isaac Sim color application
+        self.part_colors: dict = {}  # part_name -> [r, g, b] (0-1 range)
 
         for node in self.assembly.root_nodes:
             link = self.build_robot(node)
             self.robot.base_links.append(link)
+        
+        # NEW: Save color mapping file after building robot
+        self.save_color_mapping()
 
     def part_is_ignored(self, name: str, what: str) -> bool:
         """
@@ -210,7 +216,8 @@ class RobotBuilder:
 
     def get_color(self, instance: dict) -> np.ndarray:
         """
-        Retrieve the color of a part
+        Retrieve the color of a part.
+        DEFAULT: Blue if no color specified (common for robotics visualization).
         """
         if self.config.color is not None:
             color = np.array(self.config.color)
@@ -221,7 +228,8 @@ class RobotBuilder:
                 partid=instance["partId"],
             )
 
-            color = np.array([0.5, 0.5, 0.5, 1.0])
+            # Default to nice blue color for robotics (instead of gray)
+            color = np.array([0.3, 0.5, 0.8, 1.0])  # Professional blue
 
             # XXX: There must be a better way to retrieve the part color
             for entry in metadata["properties"]:
@@ -275,12 +283,20 @@ class RobotBuilder:
 
             if abs(mass) < 1e-9:
                 print(
-                    warning(
-                        f"WARNING: part {instance['name']} has no mass, maybe you should assign a material to it ?"
+                    info(
+                        f"  Part {instance['name']} has no material - using default aluminum properties"
                     )
                 )
+                # Default to aluminum material properties
+                # Aluminum density: 2700 kg/m³
+                # For safety, use small default mass to avoid simulation instability
+                mass = 0.1  # kg (100 grams - reasonable for small parts)
+                # Keep COM at origin since we don't have geometry volume
+                com = [0, 0, 0]
+                # Simple default inertia for small mass
+                inertia = [[1e-4, 0, 0], [0, 1e-4, 0], [0, 0, 1e-4]]
 
-        return mass, com[:3], np.reshape(inertia[:9], (3, 3))
+        return mass, com[:3], np.reshape(np.array(inertia).flatten()[:9], (3, 3))
 
     def add_part(self, occurrence: dict):
         """
@@ -323,6 +339,10 @@ class RobotBuilder:
 
         # Obtain metadatas about part to retrieve color
         color = self.get_color(instance)
+        
+        # NEW: Store color for this part (use clean part name without instance suffix)
+        clean_part_name = self.part_name(instance, include_configuration=False)
+        self.part_colors[clean_part_name] = color[:3].tolist()  # Store RGB only (0-1 range)
 
         # Obtain the instance dynamics
         mass, com, inertia = self.get_dynamics(instance)
@@ -410,3 +430,39 @@ class RobotBuilder:
             joint.child = self.build_robot(child_body)
 
         return link
+    
+    def save_color_mapping(self):
+        """
+        Save part colors to JSON file for Isaac Sim automatic color application.
+        Colors are stored in 0-1 RGB format matching Isaac Sim's expected input.
+        """
+        if not self.part_colors:
+            print(info("  No colors captured (all parts may be using default colors)"))
+            return
+        
+        color_file_path = self.config.asset_path("colors.json")
+        
+        # Create color mapping with metadata
+        color_mapping = {
+            "_metadata": {
+                "description": "Part colors extracted from Onshape assembly",
+                "format": "RGB values in 0-1 range (Isaac Sim format)",
+                "robot_name": self.config.robot_name,
+                "assembly_name": getattr(self.config, 'assembly_name', 'unknown')
+            },
+            "colors": self.part_colors
+        }
+        
+        with open(color_file_path, 'w', encoding='utf-8') as f:
+            json.dump(color_mapping, f, indent=2, sort_keys=True)
+        
+        print(success(f"✓ Saved {len(self.part_colors)} part colors to colors.json"))
+        
+        # Print a sample of captured colors for verification
+        if self.part_colors:
+            print(bright("  Color samples:"))
+            for part_name, rgb in list(self.part_colors.items())[:5]:
+                rgb_255 = [int(c * 255) for c in rgb]
+                print(info(f"    {part_name}: RGB{tuple(rgb_255)} (0-255) = {rgb} (0-1)"))
+            if len(self.part_colors) > 5:
+                print(info(f"    ... and {len(self.part_colors) - 5} more"))

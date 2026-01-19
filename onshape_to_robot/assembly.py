@@ -266,6 +266,19 @@ class Assembly:
         self.occurrences: dict = {}
         for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
             self.occurrences[tuple(occurrence["path"])] = occurrence
+        
+        # Build mapping from occurrence ID to full path for subassembly path translation
+        self.occurrence_id_to_path: dict = {}
+        for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
+            path = occurrence["path"]
+            # Map the leaf ID to its full path
+            leaf_id = path[-1] if path else None
+            if leaf_id:
+                self.occurrence_id_to_path[leaf_id] = path
+        
+        # Debug: Print subassembly count
+        subasm_count = len(self.assembly_data.get("subAssemblies", []))
+        print(bright(f"* Assembly data loaded: {subasm_count} subassemblies, {len(self.occurrence_id_to_path)} mapped occurrences"))
 
     def find_instances(self, prefix: list = [], instances=None):
         """
@@ -568,10 +581,29 @@ class Assembly:
                 else:
                     self.instance_body[child] = INSTANCE_IGNORE
 
-        # Checking that all intances are assigned to a body
+        # Checking that all instances are assigned to a body
+        # SKIP subassembly instances if their internal parts already have bodies
         for instance in self.assembly_data["rootAssembly"]["instances"]:
             if instance["id"] not in self.instance_body and not instance["suppressed"]:
-                self.make_body(instance["id"])
+                # Check if this is a subassembly with internal DOFs
+                is_subassembly_with_dofs = False
+                if instance.get("type") == "Assembly":
+                    # Check if any DOF uses a part inside this subassembly
+                    for dof in self.dofs:
+                        # Check if either body is inside this subassembly
+                        for occ_id in self.instance_body:
+                            if self.instance_body[occ_id] in [dof.body1_id, dof.body2_id]:
+                                # Check if this occurrence is inside the subassembly
+                                full_path = self.occurrence_id_to_path.get(occ_id, [occ_id])
+                                if len(full_path) > 1 and full_path[0] == instance["id"]:
+                                    is_subassembly_with_dofs = True
+                                    break
+                        if is_subassembly_with_dofs:
+                            break
+                
+                # Only create body for instances that aren't subassemblies with internal DOFs
+                if not is_subassembly_with_dofs:
+                    self.make_body(instance["id"])
 
         # Processing loop closing frames
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
@@ -667,32 +699,54 @@ class Assembly:
 
     def build_tree(self, root_node: int):
         """
-        Building a tree starting a root_node
+        Build kinematic tree starting from root_node.
+        IMPROVED: Treats DOFs as UNDIRECTED graph edges.
+        Automatically determines parent-child direction via traversal from base.
+        This removes the requirement for specific mate entity ordering in Onshape.
         """
         # Append the root node
         self.root_nodes.append(root_node)
 
-        # Checking that the graph is actually a tree (no loop)
+        # Treat DOF graph as UNDIRECTED - traverse from root and orient edges
         exploring = [root_node]
         dofs = self.dofs.copy()
+        
         while len(exploring) > 0:
             current = exploring.pop()
             self.body_in_tree.append(current)
 
             children = []
             dofs_to_remove = []
+            
             for dof in dofs:
+                child_body = None
+                needs_flip = False
+                
+                # Check if DOF connects to current body (treat as undirected edge)
                 if dof.body1_id == current:
-                    dof.flip(flip_limits=False)
-                    children.append(dof.body2_id)
-                    dofs_to_remove.append(dof)
+                    # Current is body1 → body2 is child
+                    child_body = dof.body2_id
+                    needs_flip = True  # Flip so body2 becomes body1 (parent → child convention)
                 elif dof.body2_id == current:
-                    children.append(dof.body1_id)
+                    # Current is body2 → body1 is child
+                    child_body = dof.body1_id
+                    needs_flip = False  # Already oriented correctly (body2=parent → body1=child)
+                
+                if child_body is not None:
+                    # Found a connecting DOF - orient it from current (parent) to child
+                    if needs_flip:
+                        dof.flip(flip_limits=False)
+                    
+                    children.append(child_body)
                     dofs_to_remove.append(dof)
+            
+            # Remove processed DOFs
             for dof in dofs_to_remove:
                 dofs.remove(dof)
 
             self.tree_children[current] = children
+            
+            # Add children to exploration queue
             for child in children:
                 if child in self.body_in_tree:
                     raise Exception(
@@ -703,8 +757,11 @@ class Assembly:
 
     def feature_mating_two_occurrences(self):
         """
-        Iterate over all valid mating feature with two occurrences
+        Iterate over all valid mating features with two occurrences.
+        NOW INCLUDES SUBASSEMBLY MATES! (Extended for subassembly support)
         """
+        # Process root assembly features
+        # FIX: Use LEAF ID (last element) for nested paths to get actual part, not parent subassembly
         for feature in self.assembly_data["rootAssembly"]["features"]:
             if feature["featureType"] == "mate" and not feature["suppressed"]:
                 data = feature["featureData"]
@@ -717,10 +774,99 @@ class Assembly:
                 ):
                     continue
 
-                occurrence_A = data["matedEntities"][0]["matedOccurrence"][0]
-                occurrence_B = data["matedEntities"][1]["matedOccurrence"][0]
+                # Get occurrence paths (can be single ID or multi-level path)
+                occ_path_A = data["matedEntities"][0]["matedOccurrence"]
+                occ_path_B = data["matedEntities"][1]["matedOccurrence"]
+                
+                # Use LEAF ID (last element) for instance_body lookup
+                # This ensures we map to the actual PART, not a parent subassembly
+                occurrence_A = occ_path_A[-1] if occ_path_A else None
+                occurrence_B = occ_path_B[-1] if occ_path_B else None
+                
+                if occurrence_A is None or occurrence_B is None:
+                    continue
 
                 yield data, occurrence_A, occurrence_B
+        
+        # NEW: Process subassembly features with proper path translation
+        # Subassembly mates use RELATIVE occurrence IDs, but we need ABSOLUTE paths
+        # Strategy: Use occurrence_id_to_path mapping to find full paths, then use leaf IDs
+        
+        subassembly_count = len(self.assembly_data.get("subAssemblies", []))
+        if subassembly_count > 0:
+            print(bright(f"* Scanning {subassembly_count} subassemblies for additional mates..."))
+        
+        for sub_assembly in self.assembly_data.get("subAssemblies", []):
+            # Find whichroot-level instance corresponds to this subassembly
+            sub_doc_id = sub_assembly.get("documentId")
+            sub_element_id = sub_assembly.get("elementId")
+            sub_config = sub_assembly.get("configuration")
+            sub_microversion = sub_assembly.get("documentMicroversion")
+            
+            # Find matching instance in root assembly
+            parent_instance_id = None
+            for instance in self.assembly_data["rootAssembly"]["instances"]:
+                if (instance.get("type") == "Assembly" and
+                    instance.get("documentId") == sub_doc_id and
+                    instance.get("elementId") == sub_element_id and
+                    instance.get("configuration") == sub_config and
+                    instance.get("documentMicroversion") == sub_microversion):
+                    parent_instance_id = instance["id"]
+                    break
+            
+            if parent_instance_id is None:
+                print(warning(f"  WARNING: Could not find parent instance for subassembly"))
+                continue
+            
+            features_in_subassembly = sub_assembly.get("features", [])
+            mate_count = sum(1 for f in features_in_subassembly if f.get("featureType") == "mate")
+            print(bright(f"  - Subassembly '{parent_instance_id[:8]}...' with {mate_count} mate features"))
+            
+            for feature in features_in_subassembly:
+                if feature["featureType"] == "mate" and not feature.get("suppressed", False):
+                    data = feature["featureData"]
+
+                    if (
+                        "matedEntities" not in data
+                        or len(data["matedEntities"]) != 2
+                        or len(data["matedEntities"][0]["matedOccurrence"]) == 0
+                        or len(data["matedEntities"][1]["matedOccurrence"]) == 0
+                    ):
+                        continue
+
+                    # Get relative occurrence IDs from subassembly mate
+                    relative_occ_A = data["matedEntities"][0]["matedOccurrence"][0]
+                    relative_occ_B = data["matedEntities"][1]["matedOccurrence"][0]
+                    
+                    # CRITICAL FIX: Translate relative IDs to FULL PATHS
+                    # The occurrence_id_to_path mapping gives us the absolute path from root
+                    # We need to update the matedOccurrence in the data AND return correct occurrence IDs
+                    
+                    # Find full paths for these relative IDs
+                    full_path_A = self.occurrence_id_to_path.get(relative_occ_A)
+                    full_path_B = self.occurrence_id_to_path.get(relative_occ_B)
+                    
+                    if full_path_A is None or full_path_B is None:
+                        print(warning(f"    Skipping {data.get('name')}: occurrence paths not found"))
+                        continue
+                    
+                    # Verify these occurrences are actually within this subassembly
+                    if full_path_A[0] != parent_instance_id or full_path_B[0] != parent_instance_id:
+                        print(warning(f"    Skipping {data.get('name')}: occurrences not in expected subassembly"))
+                        continue
+                    
+                    # CRITICAL: Update the matedOccurrence in data to use full paths
+                    # This is needed because get_occurrence_transform() uses data["matedEntities"]
+                    data["matedEntities"][0]["matedOccurrence"] = full_path_A
+                    data["matedEntities"][1]["matedOccurrence"] = full_path_B
+                    
+                    # Use LEAF IDs for instance_body lookup (globally unique)
+                    occurrence_A = relative_occ_A
+                    occurrence_B = relative_occ_B
+                    
+                    print(success(f"    + Found subassembly mate: {data.get('name', 'unnamed')} ({occurrence_A[:8]}... <-> {occurrence_B[:8]}...)"))
+
+                    yield data, occurrence_A, occurrence_B
 
     def feature_mate_groups(self):
         """
@@ -856,8 +1002,14 @@ class Assembly:
 
     def get_limits(self, joint_type: str, name: str):
         """
-        Retrieve (low, high) limits for a given joint, if any
+        Retrieve (low, high) limits for a given joint.
+        If no limits are specified in Onshape, returns large default limits.
+        URDF requires limits for revolute/prismatic joints - unlimited motion uses large values.
         """
+        # Default limits for unlimited joints (2 orders of magnitude less than URDF max)
+        DEFAULT_REVOLUTE_LIMIT = 628.318  # ~100 * 2π radians (~100 full rotations)
+        DEFAULT_PRISMATIC_LIMIT = 100.0   # ±100 meters
+        
         enabled = False
         minimum, maximum = 0, 0
         for feature in self.features["features"]:
@@ -902,32 +1054,57 @@ class Assembly:
                     maximum -= offset
             return (minimum, maximum)
         else:
-            if joint_type != Joint.CONTINUOUS:
-                print(
-                    warning(f"WARNING: joint {name} of type {joint_type} has no limits")
-                )
-            return None
+            # No limits enabled - provide defaults for non-continuous joints
+            if joint_type == Joint.CONTINUOUS:
+                return None  # Continuous joints don't need limits
+            elif joint_type == Joint.REVOLUTE:
+                print(info(f"  Using default limits for {name}: ±{DEFAULT_REVOLUTE_LIMIT:.1f} rad (~100 rotations)"))
+                return (-DEFAULT_REVOLUTE_LIMIT, DEFAULT_REVOLUTE_LIMIT)
+            elif joint_type == Joint.PRISMATIC:
+                print(info(f"  Using default limits for {name}: ±{DEFAULT_PRISMATIC_LIMIT} m"))
+                return (-DEFAULT_PRISMATIC_LIMIT, DEFAULT_PRISMATIC_LIMIT)
+            else:
+                # For other joint types, no limits
+                return None
 
     def body_instance(self, body_id: int):
         """
-        Get the (first) instance associated with a given body
+        Get the (first) instance associated with a given body.
+        Now handles both top-level instances and nested occurrences.
         """
+        # Check top-level instances first
         for instance in self.assembly_data["rootAssembly"]["instances"]:
             if (
                 instance["id"] in self.instance_body
                 and self.instance_body[instance["id"]] == body_id
             ):
                 return instance
+        
+        # NEW: Also check in subassembly instances using leaf IDs
+        for sub_assembly in self.assembly_data.get("subAssemblies", []):
+            for instance in sub_assembly.get("instances", []):
+                if (
+                    instance["id"] in self.instance_body
+                    and self.instance_body[instance["id"]] == body_id
+                ):
+                    return instance
 
         return None
 
     def body_occurrences(self, body_id: int):
         """
-        Retrieve all occurrences associated to a given body id
+        Retrieve all occurrences associated to a given body id.
+        FIXED: Now checks both top-level IDs AND leaf IDs for subassembly parts.
         """
         for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
-            key = occurrence["path"][0]
-            if key in self.instance_body and self.instance_body[key] == body_id:
+            path = occurrence["path"]
+            # Check both first element (top-level) and last element (leaf ID for nested parts)
+            top_level_id = path[0] if path else None
+            leaf_id = path[-1] if path else None
+            
+            # Match if EITHER the top-level OR leaf ID maps to this body
+            if ((top_level_id and top_level_id in self.instance_body and self.instance_body[top_level_id] == body_id) or
+                (leaf_id and leaf_id in self.instance_body and self.instance_body[leaf_id] == body_id)):
                 yield occurrence
 
     def get_dof(self, body1_id: int, body2_id: int):
