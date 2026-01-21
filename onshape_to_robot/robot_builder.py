@@ -60,9 +60,14 @@ class RobotBuilder:
 
     def slugify(self, value: str) -> str:
         """
-        Turns a value into a slug
+        Turns a value into a slug that is valid for USD/SdfPath.
+        USD paths cannot start with a digit, so prefix if needed.
         """
-        return "".join(c if c.isalnum() else "_" for c in value).strip("_")
+        slug = "".join(c if c.isalnum() else "_" for c in value).strip("_")
+        # USD paths cannot start with a digit - prefix with "part_" if needed
+        if slug and slug[0].isdigit():
+            slug = "part_" + slug
+        return slug
 
     def printable_configuration(self, instance: dict) -> str:
         """
