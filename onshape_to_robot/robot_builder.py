@@ -287,12 +287,7 @@ class RobotBuilder:
             inertia = mass_properties["inertia"]
 
             if abs(mass) < 1e-9:
-                print(
-                    info(
-                        f"  Part {instance['name']} has no material - using default aluminum properties"
-                    )
-                )
-                # Default to aluminum material properties
+                # Default to aluminum material properties (no mass from Onshape API)
                 # Aluminum density: 2700 kg/m³
                 # For safety, use small default mass to avoid simulation instability
                 mass = 0.1  # kg (100 grams - reasonable for small parts)

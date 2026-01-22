@@ -1207,20 +1207,19 @@ class Assembly:
     
     def _merge_orphan_nested_parts(self):
         """
-        Fallback: Merge nested parts that don't have a body into their parent subassembly's body.
-        This handles cases where group members in depth-2+ subassemblies couldn't be resolved by ID.
-        Parts inside a subassembly without explicit mates get merged into the first part's body.
+        Fallback: Merge nested parts that don't have a body into their nearest ancestor's body.
+        Handles deeply nested subassemblies (depth 2, 3, etc.) by walking UP the path
+        to find any ancestor with a body assignment.
+        
+        Example: For path [powerchain_assy_id, power_chain_id, chain_part_id]
+        - Check if power_chain_id has a body → if yes, use it
+        - If not, check if powerchain_assy_id has a body → if yes, use it
         """
         merged_count = 0
         
-        # Build mapping: top-level subassembly ID → body ID (of first assigned part in that subassembly)
-        subassembly_body_mapping = {}
-        for occ_id, body_id in self.instance_body.items():
-            full_path = self.occurrence_id_to_path.get(occ_id)
-            if full_path and len(full_path) > 1:
-                top_level_id = full_path[0]
-                if top_level_id not in subassembly_body_mapping:
-                    subassembly_body_mapping[top_level_id] = body_id
+        # First, build a mapping from ALL occurrence IDs to their body IDs
+        # including intermediate subassemblies that might have been assigned bodies
+        id_to_body = dict(self.instance_body)
         
         # Find orphan parts (occurrences without body assignment)
         for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
@@ -1229,24 +1228,25 @@ class Assembly:
                 continue  # Skip top-level parts
             
             leaf_id = path[-1]
-            top_level_id = path[0]
             
-            # Check if this part has a body assignment
+            # Check if this part already has a body assignment
             if leaf_id in self.instance_body:
                 continue  # Already assigned
             
-            # Try to merge into parent subassembly's body
-            if top_level_id in subassembly_body_mapping:
-                parent_body_id = subassembly_body_mapping[top_level_id]
-                self.instance_body[leaf_id] = parent_body_id
-                merged_count += 1
-            elif top_level_id in self.instance_body:
-                # Use the top-level instance's body
-                self.instance_body[leaf_id] = self.instance_body[top_level_id]
+            # Walk UP the path (from second-to-last to first) looking for nearest ancestor with a body
+            assigned_body = None
+            for i in range(len(path) - 2, -1, -1):  # Start from parent, go to root
+                ancestor_id = path[i]
+                if ancestor_id in id_to_body:
+                    assigned_body = id_to_body[ancestor_id]
+                    break
+            
+            if assigned_body is not None:
+                self.instance_body[leaf_id] = assigned_body
                 merged_count += 1
         
         if merged_count > 0:
-            print(success(f"+ Merged {merged_count} orphan nested parts into parent subassembly bodies"))
+            print(success(f"+ Merged {merged_count} orphan nested parts into ancestor subassembly bodies"))
 
     def feature_mating_two_occurrences(self):
         """
@@ -1613,23 +1613,34 @@ class Assembly:
     def body_occurrences(self, body_id: int):
         """
         Retrieve all occurrences associated to a given body id.
-        FIXED: Checks ALL path elements (top-level, intermediate, AND leaf IDs) for subassembly parts.
-        This ensures deeply nested parts from external subassemblies are correctly associated.
+        FIXED: Check leaf ID first (most specific), then walk UP the path looking
+        for the nearest ancestor with a body assignment.
+        
+        This prevents sibling subassembly parts from leaking into each other 
+        while still correctly associating nested parts with their parent's body.
+        
+        Example: 
+        - carriage_parent parts have paths like [carriage_parent_id, part_id]
+        - powerchain parts have paths like [carriage_parent_id, powerchain_assy_id, part_id]
+        
+        For powerchain parts: leaf_id (part) checked first, then powerchain_assy_id.
+        The carriage_parent_id is NOT checked because a MORE SPECIFIC match exists.
         """
         for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
             path = occurrence["path"]
             if not path:
                 continue
             
-            # Check ALL elements in the path - any match means this occurrence belongs to the body
-            # This handles: top-level, intermediate subassemblies, AND leaf parts
-            matches_body = False
-            for path_element in path:
-                if path_element in self.instance_body and self.instance_body[path_element] == body_id:
-                    matches_body = True
-                    break
+            # Walk the path from LEAF to ROOT, finding the first (most specific) body match
+            # This ensures nested subassembly parts match their own body, not an ancestor's
+            matched_body = None
+            for i in range(len(path) - 1, -1, -1):  # Start from leaf, go toward root
+                path_element = path[i]
+                if path_element in self.instance_body:
+                    matched_body = self.instance_body[path_element]
+                    break  # Stop at first (most specific) match
             
-            if matches_body:
+            if matched_body == body_id:
                 yield occurrence
 
     def get_dof(self, body1_id: int, body2_id: int):
