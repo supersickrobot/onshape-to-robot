@@ -83,6 +83,8 @@ class Assembly:
         # Map a (top-level) instance id to a body id
         self.current_body_id: int = 0
         self.instance_body: dict[str, int] = {}
+        # Track merge history for debugging
+        self.merge_history: list = []  # List of (from_body, to_body, reason) tuples
         # Frames object
         self.frames: list[Frame] = []
         # Loop closure constraints
@@ -106,6 +108,7 @@ class Assembly:
         self.find_assembly()
         self.check_configuration()
         self.retrieve_assembly()
+        self._build_part_identity_registry()
         self.find_instances()
         self.load_features()
         self.load_configuration()
@@ -271,13 +274,12 @@ class Assembly:
         # Build comprehensive mapping for subassembly path resolution
         self._build_subassembly_mappings()
         
-        # RECURSIVE: Fetch full assembly data for each subassembly independently
-        # This gives us the subassembly's own occurrence list with LOCAL IDs that match feature references
-        self._fetch_all_subassemblies_recursively()
+        #  NOT fetching subassemblies separately - using FLAT global occurrences approach
+        # All parts and their paths are in rootAssembly.occurrences regardless of nesting
         
-        # Debug: Print subassembly count
+        # Debug: Print data loaded
         subasm_count = len(self.assembly_data.get("subAssemblies", []))
-        print(bright(f"* Assembly data loaded: {subasm_count} subassemblies, {len(self.occurrence_id_to_path)} mapped occurrences"))
+        print(bright(f"* Assembly data loaded (FLAT): {subasm_count} subassembly definitions, {len(self.occurrence_id_to_path)} total parts"))
 
     def _build_subassembly_mappings(self):
         """
@@ -359,6 +361,172 @@ class Assembly:
                             if new_entry not in self.subassembly_instances[child_key]:
                                 self.subassembly_instances[child_key].append(new_entry)
                                 changed = True
+    
+    def _build_part_identity_registry(self):
+        """
+        Build mapping from stable part identity to ALL occurrence IDs.
+        This allows finding all occurrences of the same physical part regardless of assembly context.
+        Uses immutable properties: (documentId, elementId, partId, configuration)
+        """
+        from collections import defaultdict
+        
+        self.part_identity_to_occurrences = defaultdict(list)
+        
+        print(bright("* Building Part Identity Registry (stable part identification)..."))
+        
+        # Build instance ID to properties mapping from ALL instances
+        instance_properties = {}
+        
+        # Get root assembly instances
+        for instance in self.assembly_data["rootAssembly"]["instances"]:
+            if instance.get("type") == "Part":
+                instance_properties[instance["id"]] = {
+                    "documentId": instance.get("documentId", ""),
+                    "elementId": instance.get("elementId", ""),
+                    "partId": instance.get("partId", ""),
+                    "configuration": instance.get("configuration", "default"),
+                    "name": instance.get("name", "unnamed")
+                }
+        
+        # Get subassembly instances
+        for sub_assembly in self.assembly_data.get("subAssemblies", []):
+            for instance in sub_assembly.get("instances", []):
+                if instance.get("type") == "Part":
+                    instance_properties[instance["id"]] = {
+                        "documentId": instance.get("documentId", ""),
+                        "elementId": instance.get("elementId", ""),
+                        "partId": instance.get("partId", ""),
+                        "configuration": instance.get("configuration", "default"),
+                        "name": instance.get("name", "unnamed")
+                    }
+        
+        # Map every occurrence by its stable identity
+        for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
+            path = occurrence["path"]
+            if not path:
+                continue
+            
+            leaf_id = path[-1]
+            props = instance_properties.get(leaf_id)
+            
+            if props:
+                # Create stable identity tuple
+                identity = (
+                    props["documentId"],
+                    props["elementId"],
+                    props["partId"],
+                    props["configuration"]
+                )
+                
+                self.part_identity_to_occurrences[identity].append({
+                    "occurrence_id": leaf_id,
+                    "path": path,
+                    "transform": occurrence["transform"],
+                    "name": props["name"]
+                })
+        
+        # Report duplicates (same part in multiple contexts)
+        duplicate_count = sum(1 for occ_list in self.part_identity_to_occurrences.values() if len(occ_list) > 1)
+       
+        if duplicate_count > 0:
+            print(success(f"+ Built Part Identity Registry: {len(self.part_identity_to_occurrences)} unique parts, {duplicate_count} with multiple occurrences"))
+        else:
+            print(success(f"+ Built Part Identity Registry: {len(self.part_identity_to_occurrences)} unique parts (no duplicates)"))
+    
+    def _get_instance_by_id(self, instance_id: str):
+        """
+        Look up instance properties by ID from root or subassemblies.
+        Returns instance dict or None if not found.
+        """
+        # Check root assembly instances
+        for instance in self.assembly_data["rootAssembly"]["instances"]:
+            if instance["id"] == instance_id:
+                return instance
+        
+        # Check subassembly instances
+        for sub_assembly in self.assembly_data.get("subAssemblies", []):
+            for instance in sub_assembly.get("instances", []):
+                if instance["id"] == instance_id:
+                    return instance
+        
+        return None
+    
+    def resolve_occurrence_globally(self, local_occ_id: str, context_prefix=None, mate_occurrence_path=None):
+        """
+        Given a local occurrence ID (from subassembly mate), find the
+        corresponding global occurrence ID that should be used for body mapping.
+        
+        CRITICAL: Uses the full mate_occurrence_path when available to ensure
+        we get the CORRECT instance when the same part appears multiple times
+        in different subassemblies.
+        
+        Args:
+            local_occ_id: The occurrence ID from mate (may be context-local)
+            context_prefix: Path prefix if this is from a subassembly mate
+            mate_occurrence_path: FULL occurrence path from the mate entity (preferred)
+        
+        Returns:
+            Global occurrence ID to use for body mapping
+        """
+        # BEST: If we have the full mate occurrence path, find exact match in global occurrences
+        if mate_occurrence_path and len(mate_occurrence_path) > 0:
+            # The mate path tells us the EXACT subassembly context
+            # Search for global occurrence with matching path
+            for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
+                global_path = occurrence["path"]
+                # Check if paths match (either exactly or the mate path is a suffix)
+                if global_path == mate_occurrence_path:
+                    leaf_id = global_path[-1]
+                    if leaf_id in self.instance_body:
+                        return leaf_id
+                # Also check if global path ENDS with mate path (for nested subassemblies)
+                if len(global_path) >= len(mate_occurrence_path):
+                    if global_path[-len(mate_occurrence_path):] == mate_occurrence_path:
+                        leaf_id = global_path[-1]
+                        if leaf_id in self.instance_body:
+                            return leaf_id
+        
+        # Try direct lookup (works for top-level mates)
+        if local_occ_id in self.instance_body:
+            return local_occ_id
+        
+        # Get instance properties for this local ID
+        instance = self._get_instance_by_id(local_occ_id)
+        if not instance or instance.get("type") != "Part":
+            return local_occ_id  # Fallback for non-parts
+        
+        # Build stable identity
+        identity = (
+            instance.get("documentId", ""),
+            instance.get("elementId", ""),
+            instance.get("partId", ""),
+            instance.get("configuration", "default")
+        )
+        
+        # Find ALL occurrences of this same part
+        candidates = self.part_identity_to_occurrences.get(identity, [])
+        
+        if len(candidates) == 0:
+            return local_occ_id  # Fallback if not found
+        
+        elif len(candidates) == 1:
+            # Only one instance of this part exists - use it
+            return candidates[0]["occurrence_id"]
+        
+        elif len(candidates) > 1:
+            # Multiple instances - use context to disambiguate
+            if context_prefix:
+                # Find occurrence whose path starts with context_prefix
+                for candidate in candidates:
+                    if self._path_starts_with(candidate["path"], context_prefix):
+                        return candidate["occurrence_id"]
+            
+            # Log warning since we're guessing
+            inst_name = instance.get("name", "unknown")
+            print(warning(f"    WARNING: Multiple instances of '{inst_name}' - using first"))
+            return candidates[0]["occurrence_id"]
+        
+        return local_occ_id  # Final fallback
     
     def _fetch_all_subassemblies_recursively(self):
         """
@@ -664,47 +832,104 @@ class Assembly:
 
     def process_mates(self):
         """
-        Pre-assign all top-level instances to a separate body id
+        Assign every part as a separate body, then process explicit mates only.
+        NO implicit merging - only explicit mate prefixes and mateGroups create relationships.
         """
-        top_level_instances = self.assembly_data["rootAssembly"]["instances"]
-        self.make_body(top_level_instances[0]["id"])
-        
         # Debug: Print top-level instances for tracing
+        top_level_instances = self.assembly_data["rootAssembly"]["instances"]
         print(bright(f"* Top-level instances:"))
         for inst in top_level_instances:
             inst_type = inst.get("type", "Unknown")
             inst_name = inst.get("name", "unnamed")
             inst_id = inst["id"][:8]
             print(bright(f"    - {inst_name} ({inst_type}) [{inst_id}...]"))
+        
+        # NEW: Assign EVERY occurrence as a separate body upfront
+        print(bright(f"* Assigning body IDs to all {len(self.assembly_data['rootAssembly']['occurrences'])} leaf parts..."))
+        for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
+            path = occurrence["path"]
+            if path:
+                leaf_id = path[-1]
+                if leaf_id not in self.instance_body:
+                    self.make_body(leaf_id)
+        
+        print(success(f"+ Assigned {len(self.instance_body)} unique body IDs (flat structure)"))
 
-        # We first search for DOFs - using mate type detection instead of requiring "dof_" prefix
-        # This allows using natural Onshape naming like "prismatic_*", "revolute_*", etc.
+        # FIRST: Process mateGroups to merge bodies BEFORE creating DOFs
+        # This ensures DOF body IDs reference the correct merged bodies
+        print(bright(f"* Processing mateGroups..."))
+        group_count = 0
+        for group in self.feature_mate_groups():
+            group_count += 1
+            print(bright(f"\n  === Group {group_count} has {len(group)} members ==="))
+            
+            # Show all members and their initial body IDs
+            print(bright(f"  Initial member body IDs:"))
+            for i, occ_id in enumerate(group):
+                body_id = self.instance_body.get(occ_id, "?")
+                inst = self._get_instance_by_id(occ_id)
+                inst_name = inst.get("name", "unknown") if inst else "unknown"
+                print(info(f"    [{i}] {inst_name[:30]:30s} occ={occ_id[:12]:12s} → body_{body_id}"))
+            
+            #Perform merges
+            print(bright(f"  Merging all into first member's body:"))
+            for k in range(1, len(group)):
+                occurrence_A = group[0]
+                occurrence_B = group[k]
+                
+                body_a_id_before = self.instance_body.get(occurrence_A, "?")
+                body_b_id_before = self.instance_body.get(occurrence_B, "?")
+                
+                self.merge_bodies(occurrence_A, occurrence_B)
+                
+                body_a_id_after = self.instance_body.get(occurrence_A, "?")
+                body_b_id_after = self.instance_body.get(occurrence_B, "?")
+                
+                if body_a_id_before != body_b_id_before:
+                    print(info(f"    [{k}] Merged body_{body_b_id_before} into body_{body_a_id_before} → both now body_{body_a_id_after}"))
+        
+        print(success(f"\n+ Merged bodies via {group_count} mateGroups, {len(set(self.instance_body.values()))} unique bodies remain"))
+
+        # DIAGNOSTIC: Print all body assignments after merging, grouped by body ID
+        print(bright(f"\n* Body Reference Table (after mateGroup merging):"))
+        print(bright(f"  {'Body ID':<12} {'Part Name':<50} {'Occ ID':<20}"))
+        print(bright(f"  {'-'*12} {'-'*50} {'-'*20}"))
+        
+        # Build reverse mapping: body_id → (part_name, occ_id)
+        # Only show ONE representative part per body (the first one found)
+        body_to_parts = {}
+        for occ_id, body_id in self.instance_body.items():
+            if body_id not in body_to_parts:
+                # Get part name
+                inst = self._get_instance_by_id(occ_id)
+                part_name = inst.get("name", "unknown") if inst else "unknown"
+                body_to_parts[body_id] = (part_name, occ_id)
+        
+        # Print sorted by body ID
+        for body_id in sorted(body_to_parts.keys()):
+            part_name, occ_id = body_to_parts[body_id]
+            print(info(f"  body_{body_id:<8} {part_name:<50} {occ_id[:18]}..."))
+        
+        print(bright(f"  Total: {len(body_to_parts)} unique bodies\n"))
+
+        # SECOND: Process ONLY explicitly named mates with specific prefixes
+        # Supported: prismatic_*, revolute_*, fixed_*
+        # Ignored: Everything else (including unnamed FASTENED mates)
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
-            # Determine if this is a DOF based on mate type and naming patterns
             mate_type = data["mateType"]
             mate_name = data["name"]
             
-            # DOF detection logic:
-            # 1. Explicit DOF naming: starts with "dof_"
-            # 2. Joint type naming: starts with joint type (prismatic_, revolute_, slider_, cylindrical_)
-            # 3. Exclude fixed mates unless explicitly marked as dof
-            is_explicit_dof = mate_name.startswith("dof_")
-            is_typed_joint = (
-                mate_name.startswith("prismatic_") or 
-                mate_name.startswith("revolute_") or 
-                mate_name.startswith("slider_") or 
-                mate_name.startswith("cylindrical_") or
-                mate_name.startswith("ball_")
-            )
+            # EXPLICIT PREFIX DETECTION - only process these:
+            is_prismatic = mate_name.startswith("prismatic_")
+            is_revolute = mate_name.startswith("revolute_")
+            is_fixed = mate_name.startswith("fixed_")
             
-            # Skip if this is a special-purpose mate (not a DOF)
-            if (mate_name.startswith("fix_") or 
-                mate_name.startswith("closing_") or 
-                mate_name.startswith("frame_")):
+            # Skip special-purpose mates
+            if (mate_name.startswith("closing_") or mate_name.startswith("frame_")):
                 continue
             
-            # Only process as DOF if explicitly marked or typed as a joint
-            if not (is_explicit_dof or is_typed_joint):
+            # Only process explicit joint prefixes
+            if not (is_prismatic or is_revolute or is_fixed):
                 continue
             
             # Process the DOF name, removing dof prefix and inv suffix
@@ -765,13 +990,36 @@ class Assembly:
             limits_str = ""
             if limits is not None:
                 limits_str = f"[{round(limits[0], 3)}: {round(limits[1], 3)}]"
+            # DEBUG: Log full IDs for carriage-related mates
+            if 'carriage' in name.lower() and ('J1' in name or 'J3' in name):
+                print(info(f"  DEBUG {name}: occurrence_A={occurrence_A}, occurrence_B={occurrence_B}"))
+                print(info(f"         occurrence_A in instance_body: {occurrence_A in self.instance_body}"))
+                print(info(f"         occurrence_B in instance_body: {occurrence_B in self.instance_body}"))
+                if occurrence_A in self.instance_body:
+                    print(info(f"         occurrence_A maps to body_{self.instance_body[occurrence_A]}"))
+                if occurrence_B in self.instance_body:
+                    print(info(f"         occurrence_B maps to body_{self.instance_body[occurrence_B]}"))
+            
             print(success(f"+ Found DOF: {name} ({joint_type}) {limits_str}"))
 
             # Ensure occurrences are body
             if occurrence_A not in self.instance_body:
+                print(warning(f"  WARNING: Creating new body for occurrence_A {occurrence_A[:12]}... (not pre-assigned) for mate {mate_name}"))
                 self.make_body(occurrence_A)
             if occurrence_B not in self.instance_body:
+                print(warning(f"  WARNING: Creating new body for occurrence_B {occurrence_B[:12]}... (not pre-assigned) for mate {mate_name}"))
                 self.make_body(occurrence_B)
+
+            # Get actual part names for debugging
+            inst_A = self._get_instance_by_id(occurrence_A)
+            inst_B = self._get_instance_by_id(occurrence_B)
+            name_A = inst_A.get("name", "?") if inst_A else "?"
+            name_B = inst_B.get("name", "?") if inst_B else "?"
+            body_A = self.instance_body[occurrence_A]
+            body_B = self.instance_body[occurrence_B]
+            
+            # Show which parts are being connected
+            print(info(f"    DOF connects: {name_A} (body_{body_A}) ↔ {name_B} (body_{body_B})"))
 
             dof = DOF(
                 self.instance_body[occurrence_A],
@@ -787,25 +1035,35 @@ class Assembly:
 
             self.dofs.append(dof)
 
-        # Merging fixed links
-        for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
-            if data["name"].startswith("fix_") or (
-                data["mateType"] == "FASTENED"
-                and not data["name"].startswith("dof_")
-                and not data["name"].startswith("closing_")
-                and not data["name"].startswith("frame_")
-            ):
-                self.merge_bodies(occurrence_A, occurrence_B)
+        # FILTER: Remove DOFs where both ends are the same body (merged by mateGroups)
+        # This happens when parts in a mateGroup also have explicit fixed_* mates between them
+        print(bright(f"\n* Filtering self-loop DOFs (where both ends merged to same body)..."))
+        initial_dof_count = len(self.dofs)
+        
+        # Log which DOFs are being filtered
+        for dof in self.dofs:
+            if dof.body1_id == dof.body2_id:
+                parent_inst = self.body_instance(dof.body2_id)
+                child_inst = self.body_instance(dof.body1_id)
+                parent_name = parent_inst.get("name", "?") if parent_inst else "?"
+                child_name = child_inst.get("name", "?") if child_inst else "?"
+                print(warning(f"  FILTERING self-loop: {dof.name} (body_{dof.body1_id}={child_name} <-> body_{dof.body2_id}={parent_name})"))
+        
+        self.dofs = [dof for dof in self.dofs if dof.body1_id != dof.body2_id]
+        filtered_count = initial_dof_count - len(self.dofs)
+        
+        if filtered_count > 0:
+            print(success(f"+ Filtered {filtered_count} self-loop DOFs"))
+        else:
+            print(info(f"  No self-loop DOFs to filter"))
+        
+        # DEBUG: Show final body IDs for J1 and J3 DOFs
+        print(bright(f"\n* Final DOF body IDs after filtering:"))
+        for dof in self.dofs:
+            if 'carriage' in dof.name.lower() and ('J1' in dof.name or 'J3' in dof.name):
+                print(info(f"  {dof.name}: body_{dof.body1_id} <-> body_{dof.body2_id}"))
 
-        # Merging mate gorups
-        for group in self.feature_mate_groups():
-            for k in range(1, len(group)):
-                occurrence_A = group[0]
-                occurrence_B = group[k]
-
-                self.merge_bodies(occurrence_A, occurrence_B)
-
-        # Processing frame mates
+        # Processing frame mates (frames are attached coordinate systems)
         for data, occurrence_A, occurrence_B in self.feature_mating_two_occurrences():
             if data["name"].startswith("frame_"):
                 name = "_".join(data["name"].split("_")[1:])
@@ -948,16 +1206,256 @@ class Assembly:
 
     def build_trees(self):
         """
-        Perform checks on the produced tree
+        Build kinematic tree from mates starting with the FIRST top-level instance as root.
+        All other parts must chain from the root through mate connections.
+        Disconnected parts are removed and logged.
         """
+        # FORCE first top-level instance as THE root (only root allowed)
+        top_level_instances = self.assembly_data["rootAssembly"]["instances"]
+        if not top_level_instances:
+            raise Exception("ERROR: No instances found in assembly")
+        
+        first_instance_id = top_level_instances[0]["id"]
+        first_instance_name = top_level_instances[0].get("name", "unnamed")
+        
+        # Find the body ID for the first instance
+        root_body_id = None
+        for occ_id, body_id in self.instance_body.items():
+            if occ_id == first_instance_id:
+                root_body_id = body_id
+                break
+        
+        if root_body_id is None:
+            raise Exception(f"ERROR: Could not find body for first instance {first_instance_name}")
+        
+        print(success(f"* Using FIRST instance as root: {first_instance_name}"))
+        
+        # Build tree by traversing mates from root
         self.body_in_tree = []
-        for body_id in self.instance_body.values():
-            if body_id != INSTANCE_IGNORE and body_id not in self.body_in_tree:
-                self.build_tree(body_id)
+        self.root_nodes = [root_body_id]
+        self.build_tree_from_mates(root_body_id)
+        
+        # Identify disconnected bodies but KEEP them in the URDF for debugging
+        all_body_ids = set(self.instance_body.values())
+        connected_body_ids = set(self.body_in_tree)
+        disconnected_body_ids = all_body_ids - connected_body_ids - {INSTANCE_IGNORE}
+        
+        # Filter out subassembly containers at ALL levels - they're not real parts
+        # Find all instances that are type "Assembly" (not "Part")
+        subassembly_container_body_ids = set()
+        
+        # Method 1: Check EVERY occurrence ID in instance_body to see if its instance type is "Assembly"
+        for occ_id, body_id in self.instance_body.items():
+            instance = self._get_instance_by_id(occ_id)
+            if instance and instance.get("type") == "Assembly":
+                subassembly_container_body_ids.add(body_id)
+        
+        # Method 2: Check if this occurrence ID is a known subassembly container from path mapping
+        # This catches nested subassemblies at any depth
+        for sub_key, locations in self.subassembly_instances.items():
+            for prefix_path, instance_id in locations:
+                if instance_id in self.instance_body:
+                    subassembly_container_body_ids.add(self.instance_body[instance_id])
+        
+        # Remove subassembly containers from disconnected list
+        real_disconnected = disconnected_body_ids - subassembly_container_body_ids
+        
+        if real_disconnected:
+            print(warning(f"\n!  WARNING: {len(real_disconnected)} disconnected body groups (KEEPING in URDF for debugging):"))
+            # Group disconnected bodies by their display name to show unique parts
+            parts_by_name = {}
+            for body_id in real_disconnected:
+                instance = self.body_instance(body_id)
+                if instance:
+                    name = instance.get('name', 'unnamed')
+                    if name not in parts_by_name:
+                        parts_by_name[name] = []
+                    parts_by_name[name].append(body_id)
+            
+            for name, body_ids in parts_by_name.items():
+                if len(body_ids) == 1:
+                    print(warning(f"  ! UNCONNECTED (kept): {name} (body_{body_ids[0]})"))
+                else:
+                    print(warning(f"  ! UNCONNECTED (kept): {name} ({len(body_ids)} instances: {', '.join(f'body_{b}' for b in body_ids)})"))
+        
+        print(success(f"* Kinematic tree built: 1 root, {len(self.body_in_tree)} connected bodies, {len(disconnected_body_ids)} unconnected"))
+    
+    def print_kinematic_tree(self):
+        """Print visual tree structure using ASCII box-drawing characters."""
+        print(bright("\n📊 Kinematic Tree Structure:"))
+        print(bright("=" * 70))
+        
+        if not self.root_nodes:
+            print(error("  No root nodes found!"))
+            return
+        
+        root_body_id = self.root_nodes[0]
+        root_instance = self.body_instance(root_body_id)
+        root_name = root_instance.get("name", "unnamed") if root_instance else f"body_{root_body_id}"
+        
+        print(success(f"  {root_name} (ROOT)"))
+        self._print_tree_recursive(root_body_id, prefix="", is_last=True)
+        print()
+    
+    def _print_tree_recursive(self, body_id, prefix="", is_last=True):
+        """Recursively print tree branches."""
+        children = self.tree_children.get(body_id, [])
+        
+        for i, child_body_id in enumerate(children):
+            is_last_child = (i == len(children) - 1)
+            
+            # Get child instance name
+            child_instance = self.body_instance(child_body_id)
+            child_name = child_instance.get("name", "unnamed") if child_instance else f"body_{child_body_id}"
+            
+            # Get joint connecting parent to child
+            joint_info = ""
+            try:
+                dof = self.get_dof(body_id, child_body_id)
+                joint_type_symbol = {
+                    Joint.PRISMATIC: "⇄",
+                    Joint.REVOLUTE: "⟲",
+                    Joint.FIXED: "─",
+                    Joint.CONTINUOUS: "⟳"
+                }.get(dof.joint_type, "?")
+                joint_info = f" [{joint_type_symbol} {dof.name}]"
+            except:
+                pass
+            
+            # Draw tree characters
+            connector = "└── " if is_last_child else "├── "
+            print(success(f"  {prefix}{connector}{child_name}{joint_info}"))
+            
+            # Recurse to children
+            extension = "    " if is_last_child else "│   "
+            self._print_tree_recursive(child_body_id, prefix + extension, is_last_child)
+    
+    def print_motion_joints(self):
+        """Print all revolute and prismatic joints (motion DOFs)."""
+        print(bright("\n🔧 Motion Joints (Revolute & Prismatic):"))
+        print(bright("=" * 70))
+        
+        motion_dofs = [dof for dof in self.dofs if dof.joint_type in [Joint.REVOLUTE, Joint.PRISMATIC, Joint.CONTINUOUS]]
+        
+        if not motion_dofs:
+            print(info("  No motion joints found"))
+            return
+        
+        for dof in motion_dofs:
+            parent_instance = self.body_instance(dof.body2_id)
+            child_instance = self.body_instance(dof.body1_id)
+            
+            parent_name = parent_instance.get("name", f"body_{dof.body2_id}") if parent_instance else f"body_{dof.body2_id}"
+            child_name = child_instance.get("name", f"body_{dof.body1_id}") if child_instance else f"body_{dof.body1_id}"
+            
+            joint_type_name = {
+                Joint.PRISMATIC: "PRISMATIC",
+                Joint.REVOLUTE: "REVOLUTE",
+                Joint.CONTINUOUS: "CONTINUOUS"
+            }.get(dof.joint_type, "UNKNOWN")
+            
+            limits_str = ""
+            if dof.limits:
+                limits_str = f" [{dof.limits[0]:.2f} to {dof.limits[1]:.2f}]"
+            
+            print(success(f"  {joint_type_name}: {dof.name}"))
+            print(bright(f"    Parent: {parent_name}"))
+            print(bright(f"    Child:  {child_name}{limits_str}"))
 
-        print(success(f"* Found {len(self.root_nodes)} root nodes:"))
-        for root_node in self.root_nodes:
-            print(success(f"  - {self.body_instance(root_node)['name']}"))
+    def build_tree_from_mates(self, root_body_id: int):
+        """
+        Build kinematic tree by iteratively traversing mates starting from root.
+        Mates connecting already-in-tree bodies to new bodies are processed.
+        This ensures we build from the root outward through mate connections.
+        """
+        # Start with root in tree
+        self.body_in_tree.append(root_body_id)
+        self.tree_children[root_body_id] = []
+        
+        # Copy DOF list - we'll remove processed ones
+        remaining_dofs = self.dofs.copy()
+        
+        # Iteratively connect bodies through mates
+        progress = True
+        iteration = 0
+        max_iterations = 1000  # Prevent infinite loops
+        
+        print(bright(f"\n* Building tree from mates (starting from root body_{root_body_id}):"))
+        
+        while progress and remaining_dofs and iteration < max_iterations:
+            progress = False
+            iteration += 1
+            dofs_to_remove = []
+            
+            # DEBUG: Show tree state at start of iteration
+            if iteration <= 3 or (iteration % 10 == 0):
+                print(info(f"   Iteration {iteration}: {len(self.body_in_tree)} bodies in tree, {len(remaining_dofs)} DOFs remaining"))
+            
+            for dof in remaining_dofs:
+                # Check if this mate connects a body already in tree to a new body
+                parent_in_tree = dof.body2_id in self.body_in_tree
+                child_in_tree = dof.body1_id in self.body_in_tree
+                
+                # DEBUG: Log J3 specifically
+                if 'carriage_J3' in dof.name:
+                    print(info(f"   Checking {dof.name}: body_{dof.body1_id} <-> body_{dof.body2_id}, parent_in_tree={parent_in_tree}, child_in_tree={child_in_tree}"))
+                
+                if parent_in_tree and not child_in_tree:
+                    # body2 (parent) is in tree, body1 (child) is new - add it
+                    # DOF already oriented correctly (body2=parent → body1=child)
+                    parent_body = dof.body2_id
+                    child_body = dof.body1_id
+                    
+                    self.body_in_tree.append(child_body)
+                    if parent_body not in self.tree_children:
+                        self.tree_children[parent_body] = []
+                    self.tree_children[parent_body].append(child_body)
+                    self.tree_children[child_body] = []
+                    
+                    dofs_to_remove.append(dof)
+                    progress = True
+                    
+                elif child_in_tree and not parent_in_tree:
+                    # body1 (child) is in tree, body2 (parent) is new
+                    # In tree context: body1 becomes parent, body2 becomes child
+                    # flip() changes transform but NOT body IDs, so we manually swap roles
+                    dof.flip(flip_limits=False)
+                    parent_body = dof.body1_id  # Was kinematic child, now tree parent (already in tree)
+                    child_body = dof.body2_id   # Was kinematic parent, now tree child (NEW to tree)
+                    
+                    self.body_in_tree.append(child_body)
+                    if parent_body not in self.tree_children:
+                        self.tree_children[parent_body] = []
+                    self.tree_children[parent_body].append(child_body)
+                    self.tree_children[child_body] = []
+                    
+                    dofs_to_remove.append(dof)
+                    progress = True
+                    
+                elif parent_in_tree and child_in_tree:
+                    # Both already in tree - this would create a loop!
+                    # Skip this DOF but log it
+                    print(warning(f"  Skipping mate that would create loop: {dof.name}"))
+                    dofs_to_remove.append(dof)
+            
+            # Remove processed DOFs
+            for dof in dofs_to_remove:
+                remaining_dofs.remove(dof)
+        
+        if remaining_dofs:
+            print(warning(f"\n!  {len(remaining_dofs)} mates could not be connected to tree (both ends disconnected):"))
+            for dof in remaining_dofs:
+                parent_inst = self.body_instance(dof.body2_id)
+                child_inst = self.body_instance(dof.body1_id)
+                parent_name = parent_inst.get("name", f"body_{dof.body2_id}") if parent_inst else f"body_{dof.body2_id}"
+                child_name = child_inst.get("name", f"body_{dof.body1_id}") if child_inst else f"body_{dof.body1_id}"
+                
+                # Check if either body IS in tree
+                parent_in_tree = dof.body2_id in self.body_in_tree
+                child_in_tree = dof.body1_id in self.body_in_tree
+                tree_status = f"(P:{parent_in_tree} C:{child_in_tree})"
+                
+                print(warning(f"  !  {dof.name} ({dof.joint_type}): body_{dof.body2_id}={parent_name} <-> body_{dof.body1_id}={child_name} {tree_status}"))
 
     def build_tree(self, root_node: int):
         """
@@ -1044,8 +1542,26 @@ class Assembly:
                 occ_path_A = data["matedEntities"][0]["matedOccurrence"]
                 occ_path_B = data["matedEntities"][1]["matedOccurrence"]
                 
+                # IMPROVED: For root mates that reference subassembly parts, resolve using full path
+                # The path tells us the EXACT context (e.g., [chain_follower_assy_id, linear_bearing_id])
+                
+                # Resolve occurrence A
                 occurrence_A = occ_path_A[-1] if occ_path_A else None
+                if occurrence_A and occurrence_A not in self.instance_body and len(occ_path_A) > 1:
+                    # Part is inside a subassembly - find matching global occurrence
+                    for global_occ in self.assembly_data["rootAssembly"]["occurrences"]:
+                        if global_occ["path"] == occ_path_A:
+                            occurrence_A = global_occ["path"][-1]
+                            break
+                
+                # Resolve occurrence B
                 occurrence_B = occ_path_B[-1] if occ_path_B else None
+                if occurrence_B and occurrence_B not in self.instance_body and len(occ_path_B) > 1:
+                    # Part is inside a subassembly - find matching global occurrence
+                    for global_occ in self.assembly_data["rootAssembly"]["occurrences"]:
+                        if global_occ["path"] == occ_path_B:
+                            occurrence_B = global_occ["path"][-1]
+                            break
                 
                 if occurrence_A is None or occurrence_B is None:
                     continue
@@ -1111,8 +1627,15 @@ class Assembly:
                             continue
 
                         # Get local occurrence IDs from subassembly mate
-                        relative_occ_A = data["matedEntities"][0]["matedOccurrence"][0]
-                        relative_occ_B = data["matedEntities"][1]["matedOccurrence"][0]
+                        # Use LAST element [-1] to get the actual part, not the container
+                        # For nested parts: matedOccurrence = [container_id, ..., actual_part_id]
+                        local_path_A = data["matedEntities"][0]["matedOccurrence"]
+                        local_path_B = data["matedEntities"][1]["matedOccurrence"]
+                        relative_occ_A = local_path_A[-1] if local_path_A else None
+                        relative_occ_B = local_path_B[-1] if local_path_B else None
+                        
+                        if relative_occ_A is None or relative_occ_B is None:
+                            continue
                         
                         # Look up full paths using leaf ID mapping
                         full_path_A = self.occurrence_id_to_path.get(relative_occ_A)
@@ -1139,8 +1662,28 @@ class Assembly:
                         data["matedEntities"][0]["matedOccurrence"] = list(full_path_A)
                         data["matedEntities"][1]["matedOccurrence"] = list(full_path_B)
                         
-                        occurrence_A = relative_occ_A
-                        occurrence_B = relative_occ_B
+                        # Use LEAF ID from resolved paths, not local subassembly IDs
+                        occurrence_A = full_path_A[-1]
+                        occurrence_B = full_path_B[-1]
+                        
+                        # NEW: Use Part Identity Resolution to find globally consistent IDs
+                        # This resolves the case where the same part has different IDs in different contexts
+                        occurrence_A = self.resolve_occurrence_globally(occurrence_A, full_prefix)
+                        occurrence_B = self.resolve_occurrence_globally(occurrence_B, full_prefix)
+                        
+                        # FALLBACK: Check path from LEAF to ROOT for existing body
+                        # This ensures we use the most specific (leaf) match, not container
+                        if occurrence_A not in self.instance_body:
+                            for path_id in reversed(full_path_A):
+                                if path_id in self.instance_body:
+                                    occurrence_A = path_id
+                                    break
+                        
+                        if occurrence_B not in self.instance_body:
+                            for path_id in reversed(full_path_B):
+                                if path_id in self.instance_body:
+                                    occurrence_B = path_id
+                                    break
                         
                         print(success(f"    {depth_indicator}+ Found subassembly mate: {data.get('name', 'unnamed')} ({occurrence_A[:8]}... <-> {occurrence_B[:8]}...)"))
 
@@ -1148,16 +1691,58 @@ class Assembly:
         
         return self._all_mates_cache
     
+    def _get_instance_name_by_id(self, instance_id: str) -> str:
+        """
+        Look up an instance name by its ID, searching both root and subassemblies.
+        Returns empty string if not found.
+        """
+        # Check root assembly instances
+        for instance in self.assembly_data["rootAssembly"]["instances"]:
+            if instance["id"] == instance_id:
+                return instance.get("name", "")
+        
+        # Check subassembly instances
+        for sub_assembly in self.assembly_data.get("subAssemblies", []):
+            for instance in sub_assembly.get("instances", []):
+                if instance["id"] == instance_id:
+                    return instance.get("name", "")
+        
+        return ""
+    
     def _find_occurrence_path_with_prefix(self, prefix, leaf_id):
         """
         Find an occurrence path that starts with the given prefix and ends with leaf_id.
         Used for deeply nested parts where direct leaf ID mapping may not work.
+        
+        IMPORTANT: Subassembly mates use LOCAL occurrence IDs which differ from GLOBAL
+        occurrence IDs in the flattened occurrence list. When direct ID matching fails,
+        we fall back to matching by part NAME within the correct prefix path.
         """
+        # First try direct ID matching (works when IDs happen to match)
         for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
             path = occurrence["path"]
             if len(path) > len(prefix) and path[-1] == leaf_id:
                 if self._path_starts_with(path, prefix):
-                    return path
+                    return path  # Direct ID match found
+        
+        # Direct ID match failed - try NAME-based matching
+        # This handles the case where local subassembly IDs differ from global IDs
+        local_name = self._get_instance_name_by_id(leaf_id)
+        
+        if local_name:
+            # Search for occurrence with matching name within our prefix
+            for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
+                path = occurrence["path"]
+                if len(path) > len(prefix) and self._path_starts_with(path, prefix):
+                    global_leaf_id = path[-1]
+                    global_name = self._get_instance_name_by_id(global_leaf_id)
+                    if global_name == local_name:
+                        print(info(f"      Resolved by NAME: '{local_name}' (local={leaf_id[:12]}... → global={global_leaf_id[:12]}...)"))
+                        return path  # Name match found
+        
+        # Still not found - log for debugging
+        print(warning(f"      Could not resolve occurrence: leaf_id={leaf_id[:12]}..., name='{local_name}', prefix depth={len(prefix)}"))
+        
         return None
     
     def _path_starts_with(self, path, prefix):
@@ -1327,44 +1912,70 @@ class Assembly:
                             relative_occ_id = relative_occ_path[0]
                             resolved_occ_id = relative_occ_id  # May get replaced with global ID
                             
-                            # Try to find full path using leaf ID mapping
-                            full_path = self.occurrence_id_to_path.get(relative_occ_id)
+                            # CRITICAL: Must use prefix-based search, not direct ID lookup
+                            # Same subassembly instantiated twice has same local IDs but different global paths!
+                            # Direct lookup would return first instance's path even for second instance
+                            full_path = self._find_occurrence_path_with_prefix(full_prefix, relative_occ_id)
                             
                             if full_path is None:
-                                # Search for path with correct prefix
-                                full_path = self._find_occurrence_path_with_prefix(full_prefix, relative_occ_id)
+                                # Local ID not found - try matching by NAME within prefix
+                                local_inst = None
+                                for inst in sub_assembly.get("instances", []):
+                                    if inst.get("id") == relative_occ_id:
+                                        local_inst = inst
+                                        break
+                                
+                                if local_inst:
+                                    local_name = local_inst.get("name", "")
+                                    # Find occurrence in this prefix with matching name
+                                    for occurrence in self.assembly_data["rootAssembly"]["occurrences"]:
+                                        path = occurrence["path"]
+                                        if self._path_starts_with(path, full_prefix):
+                                            leaf_id = path[-1]
+                                            inst = self._get_instance_by_id(leaf_id)
+                                            if inst and inst.get("name") == local_name:
+                                                full_path = path
+                                                break
+                            
+                            # DON'T use Part Identity Resolution for mateGroups!
+                            # Groups from same subassembly definition have different prefixes
+                            # but same local IDs - resolution would collapse them incorrectly
+                            if full_path is not None:
+                                resolved_occ_id = full_path[-1]
+                                # Just use the raw occurrence ID from path - already correct
+                                group.append(resolved_occ_id)
+                                continue
                             
                             # Try using local-to-global mapping from fetched subassembly data
-                            if full_path is None and sub_element_id in self.subassembly_local_to_global:
+                            if sub_element_id in self.subassembly_local_to_global:
                                 local_mapping = self.subassembly_local_to_global[sub_element_id]
                                 if relative_occ_id in local_mapping:
                                     global_ids = local_mapping[relative_occ_id]
                                     if global_ids:
                                         global_leaf_id = global_ids[0]
                                         if global_leaf_id in self.occurrence_id_to_path:
-                                            full_path = self.occurrence_id_to_path[global_leaf_id]
-                                            resolved_occ_id = global_leaf_id
+                                            resolved_occ_id = self.resolve_occurrence_globally(global_leaf_id, full_prefix)
+                                            group.append(resolved_occ_id)
+                                            continue
                             
                             # FALLBACK for external subassemblies: Match by NAME using main assembly data
-                            if full_path is None:
-                                # Get the instance info for this local ID from subassembly
-                                local_name = None
-                                for inst in sub_assembly.get("instances", []):
-                                    if inst.get("id") == relative_occ_id:
-                                        local_name = inst.get("name", "")
-                                        break
-                                
-                                if local_name and local_name in name_to_global_ids:
-                                    # Find matching global ID that's in our prefix
-                                    for candidate_id in name_to_global_ids[local_name]:
-                                        candidate_path = self.occurrence_id_to_path.get(candidate_id)
-                                        if candidate_path and self._path_starts_with(candidate_path, full_prefix):
-                                            full_path = candidate_path
-                                            resolved_occ_id = candidate_id
-                                            break
+                            # Get the instance info for this local ID from subassembly
+                            local_name = None
+                            for inst in sub_assembly.get("instances", []):
+                                if inst.get("id") == relative_occ_id:
+                                    local_name = inst.get("name", "")
+                                    break
                             
-                            if full_path is not None and self._path_starts_with(full_path, full_prefix):
-                                group.append(resolved_occ_id)
+                            if local_name and local_name in name_to_global_ids:
+                                # Find matching global ID that's in our prefix
+                                for candidate_id in name_to_global_ids[local_name]:
+                                    candidate_path = self.occurrence_id_to_path.get(candidate_id)
+                                    if candidate_path and self._path_starts_with(candidate_path, full_prefix):
+                                        resolved_occ_id = self.resolve_occurrence_globally(candidate_id, full_prefix)
+                                        group.append(resolved_occ_id)
+                                        break
+                                else:
+                                    print(warning(f"    Group member {relative_occ_id[:8]}... not found in subassembly"))
                             else:
                                 print(warning(f"    Group member {relative_occ_id[:8]}... not found in subassembly"))
                         
@@ -1559,55 +2170,26 @@ class Assembly:
 
     def body_instance(self, body_id: int):
         """
-        Get the instance associated with a given body.
-        IMPROVED: For subassembly parts, return the SUBASSEMBLY instance (with nice name)
-        instead of the first part instance inside it.
+        Get the FIRST ACTUAL PART instance for this body (flat approach).
+        Returns the actual leaf part, NOT the subassembly container.
         """
-        # First, collect all occurrence IDs that belong to this body
-        occ_ids_for_body = [occ_id for occ_id, bid in self.instance_body.items() if bid == body_id]
+        # Find the first occurrence ID that maps to this body
+        for occ_id, bid in self.instance_body.items():
+            if bid == body_id:
+                # Get the full path for this occurrence
+                full_path = self.occurrence_id_to_path.get(occ_id, [occ_id])
+                
+                # Find the actual part instance in subassemblies
+                for sub_assembly in self.assembly_data.get("subAssemblies", []):
+                    for instance in sub_assembly.get("instances", []):
+                        if instance["id"] == occ_id:
+                            return instance
+                
+                # Check top-level instances
+                for instance in self.assembly_data["rootAssembly"]["instances"]:
+                    if instance["id"] == occ_id:
+                        return instance
         
-        # Check if all parts share a common top-level subassembly parent
-        # If so, return the subassembly instance for better naming
-        common_subassembly_id = None
-        for occ_id in occ_ids_for_body:
-            full_path = self.occurrence_id_to_path.get(occ_id)
-            if full_path and len(full_path) > 1:
-                # This is a nested part - get its top-level parent (subassembly ID)
-                top_level_id = full_path[0]
-                if common_subassembly_id is None:
-                    common_subassembly_id = top_level_id
-                elif common_subassembly_id != top_level_id:
-                    # Parts come from different subassemblies - no common parent
-                    common_subassembly_id = None
-                    break
-            else:
-                # This is a top-level part, not from a subassembly
-                common_subassembly_id = None
-                break
-        
-        # If all parts share a common subassembly parent, return that subassembly instance
-        if common_subassembly_id:
-            for instance in self.assembly_data["rootAssembly"]["instances"]:
-                if instance["id"] == common_subassembly_id:
-                    return instance
-        
-        # Otherwise, check top-level instances directly
-        for instance in self.assembly_data["rootAssembly"]["instances"]:
-            if (
-                instance["id"] in self.instance_body
-                and self.instance_body[instance["id"]] == body_id
-            ):
-                return instance
-        
-        # Fallback: Check in subassembly instances using leaf IDs
-        for sub_assembly in self.assembly_data.get("subAssemblies", []):
-            for instance in sub_assembly.get("instances", []):
-                if (
-                    instance["id"] in self.instance_body
-                    and self.instance_body[instance["id"]] == body_id
-                ):
-                    return instance
-
         return None
 
     def body_occurrences(self, body_id: int):

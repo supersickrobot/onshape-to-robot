@@ -466,3 +466,7 @@ class RobotBuilder:
                 print(info(f"    {part_name}: RGB{tuple(rgb_255)} (0-255) = {rgb} (0-1)"))
             if len(self.part_colors) > 5:
                 print(info(f"    ... and {len(self.part_colors) - 5} more"))
+        
+        # Print kinematic tree and motion joints after all parts are added
+        self.assembly.print_kinematic_tree()
+        self.assembly.print_motion_joints()
